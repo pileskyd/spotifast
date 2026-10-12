@@ -923,6 +923,8 @@ fn apply_event(state: &mut LocalState, event: PlayerEvent) -> bool {
                 Some("Spotify refused the audio key. Try again later".into()),
             );
             changed |= set(&mut state.loading, false);
+            changed |= set(&mut state.playback, Playback::Stopped);
+            changed |= set(&mut state.position_at, None);
             changed
         }
         PlayerEvent::VolumeChanged { volume } => set(&mut state.volume, volume),
@@ -1616,7 +1618,14 @@ mod tests {
 
     #[test]
     fn a_rejected_audio_key_has_its_own_error() {
-        let mut state = LocalState::default();
+        let mut state = LocalState {
+            connected: true,
+            loading: true,
+            playback: Playback::Playing,
+            position_at: Some(Instant::now()),
+            track: Some(LocalTrack::default()),
+            ..LocalState::default()
+        };
 
         assert!(apply_event(
             &mut state,
@@ -1629,6 +1638,12 @@ mod tests {
             state.error.as_deref(),
             Some("Spotify refused the audio key. Try again later")
         );
+        assert!(!state.loading);
+        assert_eq!(state.playback, Playback::Stopped);
+        assert!(state.position_at.is_none());
+        assert!(!state.is_active());
+        assert!(state.interrupted().is_none());
+        assert!(state.connected, "catalogue and Connect remain signed in");
     }
 
     #[test]

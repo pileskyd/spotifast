@@ -1251,13 +1251,15 @@ impl App {
 
     /// Where playback commands go: this computer's player or a remote device.
     pub fn target(&self) -> Target {
-        if self.local_ready && self.local.is_active() {
-            return Target::Local;
-        }
         if let Some(selected) = &self.selected_device
             && Some(selected.as_str()) != self.local_device_id.as_deref()
         {
             return Target::Remote(Some(selected.clone()));
+        }
+        // Connect may still report this player as active while a transfer
+        // settles. Commands must follow the device the user just chose.
+        if self.local_ready && self.local.is_active() {
+            return Target::Local;
         }
         if let Some(remote) = self.remote_fresh() {
             let device = remote.state.device.as_ref();
@@ -1447,7 +1449,9 @@ impl App {
 
     /// What a device is actually playing, here or elsewhere.
     fn now_playing_live(&self) -> Option<NowPlaying> {
-        if self.local.is_active() && self.local_transfer_sequence != Some(self.local.track_sequence)
+        if self.local.is_active()
+            && matches!(self.target(), Target::Local)
+            && self.local_transfer_sequence != Some(self.local.track_sequence)
         {
             let track = self.local.track.as_ref()?;
             let cached = track
@@ -2449,6 +2453,12 @@ impl App {
     }
 
     fn handle_local(&mut self, state: LocalState) {
+        // Another Connect client can transfer playback back here. A new
+        // local activation supersedes the previous remote selection; an
+        // already-active player's delayed updates do not.
+        if !self.local.is_active() && state.is_active() {
+            self.selected_device = None;
+        }
         if self
             .local_transfer_sequence
             .is_some_and(|sequence| sequence != state.track_sequence)
@@ -5049,6 +5059,7 @@ impl App {
         // For local playback, reject a fetched current row that differs from
         // the engine's current track.
         if self.local.is_active()
+            && matches!(self.target(), Target::Local)
             && let Some(track) = &self.local.track
             && fetched
                 .currently_playing
@@ -8112,9 +8123,10 @@ impl App {
 
     fn transfer(&mut self, device_id: String) {
         if Some(device_id.as_str()) == self.local_device_id.as_deref() {
+            let was_remote = matches!(self.target(), Target::Remote(_));
             self.selected_device = None;
             self.show_devices = false;
-            if !self.local.is_active() {
+            if was_remote || !self.local.is_active() {
                 // Connect transfers the active device's full playback state.
                 // A Web API snapshot may be stale and cannot recreate its queue.
                 self.queue_start_pending = Some(Target::Local);
@@ -24377,6 +24389,89 @@ mod tests {
         app.selected_device = Some("departed-phone".into());
         app.handle_api(ApiResponse::Devices(Ok(Vec::new())));
         assert_eq!(app.selected_device, None);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn selecting_a_remote_device_overrides_a_lagging_local_player() {
+        let mut app = headless_app();
+        app.local_ready = true;
+        app.local_device_id = Some("local".into());
+        app.local.track = Some(crate::player::LocalTrack::default());
+        app.local.playback = Playback::Playing;
+        app.remote = Some(RemoteSnapshot {
+            state: PlaybackState {
+                item: Some(queued_song("spotify:track:remote-song")),
+                device: Some(Device {
+                    id: Some("safari".into()),
+                    name: "Web Player (Safari)".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            received_at: Instant::now(),
+        });
+        assert_eq!(app.target(), Target::Local);
+
+        // A transfer does not immediately deactivate the Connect player.
+        app.transfer("safari".into());
+        assert!(app.local.is_active());
+        assert_eq!(app.target(), Target::Remote(Some("safari".into())));
+        let now = app.now_playing_live().unwrap();
+        assert!(!now.local);
+        assert_eq!(now.uri, "spotify:track:remote-song");
+        assert_eq!(now.device_name.as_deref(), Some("Web Player (Safari)"));
+        assert!(!app.queue_locally_reorderable());
+        assert!(!app.queue_fetch_is_stale(&Queue {
+            currently_playing: Some(queued_song("spotify:track:remote-song")),
+            ..Default::default()
+        }));
+
+        // Delayed local progress cannot steal the user's selection back.
+        app.handle_local(app.local.clone());
+        assert_eq!(app.target(), Target::Remote(Some("safari".into())));
+
+        app.backend.take_player_commands();
+        app.apply(
+            Action::PlayFromRow {
+                context: RowContext::Uris(vec!["spotify:track:next-song".into()].into()),
+                uri: "spotify:track:next-song".into(),
+                index: 0,
+            },
+            &egui::Context::default(),
+        );
+        let requests = app.backend.take_remote_play_requests();
+        assert!(matches!(
+            requests.as_slice(),
+            [ApiRequest::Remote {
+                action: RemoteAction::Play,
+                device_id: Some(id),
+                ..
+            }] if id == "safari"
+        ));
+        assert!(app.backend.take_player_commands().is_empty());
+
+        app.transfer("local".into());
+        assert_eq!(app.target(), Target::Local);
+        assert_eq!(
+            app.backend.take_player_commands(),
+            [PlayerCommand::Transfer]
+        );
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn a_new_local_connect_activation_replaces_the_remote_selection() {
+        let mut app = headless_app();
+        app.selected_device = Some("safari".into());
+        app.handle_local(LocalState {
+            connected: true,
+            playback: Playback::Playing,
+            track: Some(crate::player::LocalTrack::default()),
+            ..LocalState::default()
+        });
+        assert_eq!(app.selected_device, None);
+        assert_eq!(app.target(), Target::Local);
         app.backend.shutdown();
     }
 

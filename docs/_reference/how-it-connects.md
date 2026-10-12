@@ -228,6 +228,15 @@ that happens, Spotifast stops local playback and leaves the rest of the queue
 alone instead of treating every following track as unavailable. This refusal
 comes from Spotify; trying again later may work.
 
+A refused key also clears the local playing state and stops the progress
+clock. It does not sign out the session. Persistent refusals are tracked in
+[issue #283](https://github.com/crmne/spotifast/issues/283); a personal Web API
+app does not change which audio keys Spotify grants to librespot.
+You can select a working Spotify Web Player or another Connect device in
+the devices menu and control it from Spotifast. Commands follow that
+selection immediately, even while the previous local player still reports
+itself active during the transfer. Audio is produced by the selected device.
+
 Before adding songs to an existing playlist, Spotifast checks the rows it
 already holds. A known duplicate produces an immediate confirmation naming the
 song. Only a playlist that has not been fully loaded needs a background scan to

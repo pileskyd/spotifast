@@ -4,6 +4,9 @@
 
 <h1 align="center">Spotifast</h1>
 
+This fork checks for updates in `pileskyd/spotifast`, so an upstream release
+does not replace its playback fixes.
+
 <p align="center"><strong>Spotify, native and fast.</strong><br>A lightweight music app for Linux, macOS, and Windows.</p>
 
 <p align="center">
@@ -86,6 +89,12 @@ Library access and local playback have separate approvals. Spotifast remembers
 both using your computer's protected storage. See
 [Getting started](https://spotifast.rocks/getting-started/) for the full walkthrough
 and [How it connects](https://spotifast.rocks/how-it-connects/) for the details.
+
+If Spotify refuses the local player's audio key, playback stops and the
+progress clock stops with it. This upstream problem is tracked in
+[#283](https://github.com/crmne/spotifast/issues/283). Select a working Web
+Player or another Connect device to control playback there. Your selection
+takes effect immediately while the transfer completes.
 
 ## The Winamp mini player
 
