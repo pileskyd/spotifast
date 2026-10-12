@@ -177,6 +177,16 @@ pub struct LocalState {
     pub connected: bool,
     pub username: String,
     pub active_client: String,
+    /// This computer is the active Connect device.
+    ///
+    /// librespot raises `SessionConnected` in `handle_activate` after
+    /// `set_active(true)`, and `SessionDisconnected` in `handle_disconnect`
+    /// after `became_inactive` and before `player.stop()`. `Stopped` does
+    /// not clear it: the queue can end, and an audio key can be refused,
+    /// while Connect still has this device. `active_client` is not this
+    /// flag. This librespot revision never fills `Session::client_name`,
+    /// so `SessionClientChanged` arrives with an empty name.
+    pub connect_active: bool,
     pub error: Option<String>,
     pub seek_sequence: u64,
     /// The engine is fetching a track right now, even when the previous
@@ -931,12 +941,18 @@ fn apply_event(state: &mut LocalState, event: PlayerEvent) -> bool {
         PlayerEvent::SessionConnected { user_name, .. } => {
             let mut changed = set(&mut state.connected, true);
             changed |= set(&mut state.username, user_name);
+            // Device activation, not the login that sets `connected` earlier.
+            changed |= set(&mut state.connect_active, true);
             changed
         }
-        // In librespot this event means the Connect device became inactive,
-        // usually because another device took over. The engine session is
-        // still alive, and `Load` activates it again before starting a track.
-        PlayerEvent::SessionDisconnected { .. } => set(&mut state.active_client, String::new()),
+        // Connect gave this device away. The engine session stays up, and
+        // `Load` activates it again before starting a track. The event is
+        // queued after `became_inactive`, so `Transfer` is accepted now.
+        PlayerEvent::SessionDisconnected { .. } => {
+            let mut changed = set(&mut state.connect_active, false);
+            changed |= set(&mut state.active_client, String::new());
+            changed
+        }
         PlayerEvent::SessionClientChanged { client_name, .. } => {
             set(&mut state.active_client, client_name)
         }
@@ -1600,9 +1616,19 @@ mod tests {
     fn an_inactive_connect_device_keeps_its_engine_session() {
         let mut state = LocalState {
             connected: true,
+            connect_active: true,
             active_client: "Spotifast".into(),
             ..LocalState::default()
         };
+
+        assert!(apply_event(
+            &mut state,
+            PlayerEvent::SessionConnected {
+                connection_id: "connection".into(),
+                user_name: "listener".into(),
+            },
+        ));
+        assert!(state.connect_active);
 
         assert!(apply_event(
             &mut state,
@@ -1613,7 +1639,48 @@ mod tests {
         ));
 
         assert!(state.connected, "the Spotify session is still usable");
+        assert!(!state.connect_active);
         assert!(state.active_client.is_empty());
+        // The player stop that follows the disconnect is not a new activation.
+        state.playback = Playback::Playing;
+        assert!(apply_event(
+            &mut state,
+            PlayerEvent::Stopped {
+                play_request_id: 1,
+                track_id: uri(),
+            },
+        ));
+        assert!(!state.connect_active);
+        assert_eq!(state.playback, Playback::Stopped);
+    }
+
+    /// librespot 23fc42c emits `SessionClientChanged` with an empty
+    /// `client_name` while this device is active. The empty string is also
+    /// the default, so the name cannot tell activation from startup.
+    #[test]
+    fn an_unnamed_connect_client_does_not_report_device_activity() {
+        let mut state = LocalState::default();
+        assert!(!apply_event(
+            &mut state,
+            PlayerEvent::SessionClientChanged {
+                client_id: String::new(),
+                client_name: String::new(),
+                client_brand_name: String::new(),
+                client_model_name: String::new(),
+            },
+        ));
+        assert!(!state.connect_active);
+        assert!(state.active_client.is_empty());
+
+        assert!(apply_event(
+            &mut state,
+            PlayerEvent::SessionConnected {
+                connection_id: "connection".into(),
+                user_name: "listener".into(),
+            },
+        ));
+        assert!(state.connect_active);
+        assert_eq!(state.username, "listener");
     }
 
     #[test]
