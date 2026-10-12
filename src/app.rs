@@ -329,6 +329,20 @@ pub struct App {
     pub local_device_id: Option<String>,
     /// Ignore the previous local song until a Connect transfer reports its track.
     local_transfer_sequence: Option<u64>,
+    /// Bumped on every device choice. A Web API transfer answer applies only
+    /// when it carries this value, so a slow acknowledgement cannot restore
+    /// a device the user has already left.
+    transfer_epoch: u64,
+    /// Epoch of the newest Web API transfer that has not been answered yet.
+    remote_transfer_epoch: Option<u64>,
+    /// A Web API transfer to another device was accepted, and this player
+    /// has not since given up being the active Connect device.
+    remote_transfer_accepted: bool,
+    /// The user chose this computer while it was still the active Connect
+    /// device. librespot ignores `Transfer` in that state, so the command
+    /// waits until the player becomes inactive and can take the other
+    /// device's queue.
+    pending_local_return: bool,
     /// Local playback is authorized and the engine is connected.
     pub local_ready: bool,
     pub local_playback: LocalPlayback,
@@ -834,6 +848,10 @@ impl App {
             user: None,
             local_device_id: None,
             local_transfer_sequence: None,
+            transfer_epoch: 0,
+            remote_transfer_epoch: None,
+            remote_transfer_accepted: false,
+            pending_local_return: false,
             local_ready: false,
             local_playback: LocalPlayback::Unavailable,
             local: LocalState::default(),
@@ -2347,6 +2365,9 @@ impl App {
 
     fn reset_data(&mut self) {
         self.local_transfer_sequence = None;
+        self.remote_transfer_epoch = None;
+        self.remote_transfer_accepted = false;
+        self.pending_local_return = false;
         self.queue_start_pending = None;
         self.pending_album_queues.clear();
         self.pending_queue_batches.clear();
@@ -2458,6 +2479,21 @@ impl App {
         // already-active player's delayed updates do not.
         if !self.local.is_active() && state.is_active() {
             self.selected_device = None;
+            self.pending_local_return = false;
+            self.remote_transfer_accepted = false;
+        } else if self.local.is_active() && !state.is_active() && self.pending_local_return {
+            // A refused audio key stops the local player without Connect
+            // giving the device away. `Transfer` would be ignored, and
+            // marking a handoff would hide the player that is still ours.
+            if state
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("Spotify refused the audio key"))
+            {
+                self.pending_local_return = false;
+            } else {
+                self.transfer_active_connect_playback();
+            }
         }
         if self
             .local_transfer_sequence
@@ -6896,20 +6932,50 @@ impl App {
                 }
                 self.poll_remote_soon();
             }
-            ApiResponse::Transferred { device_id, result } => match result {
-                Ok(()) => {
-                    self.selected_device = Some(device_id);
-                    self.show_devices = false;
-                    self.remote_command_at = Some(Instant::now());
-                    self.poll_remote_soon();
-                    self.refresh_devices();
+            ApiResponse::Transferred {
+                device_id,
+                epoch,
+                result,
+            } => {
+                let tracked = self.remote_transfer_epoch == Some(epoch);
+                if tracked {
+                    self.remote_transfer_epoch = None;
                 }
-                Err(error) => self.toast_error(
-                    // Translators: {error} is an error message.
-                    gettext(self.locale, "Couldn't switch device: {error}")
-                        .replace("{error}", &error.to_string()),
-                ),
-            },
+                if result.is_ok() {
+                    // An older acceptance can still move Connect after a
+                    // newer choice. Remember it so a return here can take
+                    // the queue once this player becomes inactive.
+                    self.remote_transfer_accepted = true;
+                } else if self.pending_local_return
+                    && self.local.is_active()
+                    && tracked
+                    && self.remote_transfer_epoch.is_none()
+                    && !self.remote_transfer_accepted
+                    && !self.another_device_holds_playback()
+                {
+                    // The transfer that could move playback off this computer
+                    // failed, and no other device is playing. A later local
+                    // stop is not that handoff.
+                    self.pending_local_return = false;
+                }
+                if epoch != self.transfer_epoch {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        self.selected_device = Some(device_id);
+                        self.show_devices = false;
+                        self.remote_command_at = Some(Instant::now());
+                        self.poll_remote_soon();
+                        self.refresh_devices();
+                    }
+                    Err(error) => self.toast_error(
+                        // Translators: {error} is an error message.
+                        gettext(self.locale, "Couldn't switch device: {error}")
+                            .replace("{error}", &error.to_string()),
+                    ),
+                }
+            }
             ApiResponse::QueueAdded { label: _, result } => match result {
                 Ok(()) => {
                     // Refresh the queue after the optimistic update.
@@ -8121,31 +8187,73 @@ impl App {
         }
     }
 
+    /// Whether a fresh playback snapshot names some other device.
+    fn another_device_holds_playback(&self) -> bool {
+        self.remote_fresh().is_some_and(|remote| {
+            let id = remote
+                .state
+                .device
+                .as_ref()
+                .and_then(|device| device.id.as_deref());
+            id != self.local_device_id.as_deref()
+                && (remote.state.is_playing || remote.state.item.is_some())
+        })
+    }
+
+    /// Take the active Connect device's song, position, and queue.
+    ///
+    /// librespot ignores this command while this computer is already the
+    /// active device. Call it only once the player is inactive. The Web API
+    /// snapshot is not a substitute: it can be stale and has no queue.
+    fn transfer_active_connect_playback(&mut self) {
+        self.pending_local_return = false;
+        self.remote_transfer_accepted = false;
+        self.queue_start_pending = Some(Target::Local);
+        self.local_transfer_sequence = Some(self.local.track_sequence);
+        self.local_list = None;
+        self.resume_queue.clear();
+        self.queued_play = None;
+        self.intent_track = None;
+        self.assumed_context = None;
+        self.optimistic_playing = None;
+        self.clear_play_pending();
+        self.backend.player(PlayerCommand::Transfer);
+    }
+
     fn transfer(&mut self, device_id: String) {
+        self.transfer_epoch = self.transfer_epoch.wrapping_add(1);
+        let epoch = self.transfer_epoch;
         if Some(device_id.as_str()) == self.local_device_id.as_deref() {
             let was_remote = matches!(self.target(), Target::Remote(_));
             self.selected_device = None;
             self.show_devices = false;
+            if self.local.is_active() && (was_remote || self.pending_local_return) {
+                // `SpircCommand::Transfer` is discarded while already active.
+                // Keep the choice without pretending the queue has moved.
+                let expect_handoff = self.remote_transfer_epoch.is_some()
+                    || self.remote_transfer_accepted
+                    || self.another_device_holds_playback();
+                self.pending_local_return = expect_handoff;
+                self.poll_remote_soon();
+                return;
+            }
+            self.pending_local_return = false;
             if was_remote || !self.local.is_active() {
-                // Connect transfers the active device's full playback state.
-                // A Web API snapshot may be stale and cannot recreate its queue.
-                self.queue_start_pending = Some(Target::Local);
-                self.local_transfer_sequence = Some(self.local.track_sequence);
-                self.local_list = None;
-                self.resume_queue.clear();
-                self.queued_play = None;
-                self.intent_track = None;
-                self.assumed_context = None;
-                self.optimistic_playing = None;
-                self.clear_play_pending();
-                self.backend.player(PlayerCommand::Transfer);
+                self.transfer_active_connect_playback();
             }
             self.poll_remote_soon();
             return;
         }
+        self.pending_local_return = false;
+        self.remote_transfer_accepted = false;
+        self.remote_transfer_epoch = Some(epoch);
         let play = self.now_playing().is_some_and(|now| now.playing);
         self.selected_device = Some(device_id.clone());
-        self.backend.api(ApiRequest::Transfer { device_id, play });
+        self.backend.api(ApiRequest::Transfer {
+            device_id,
+            play,
+            epoch,
+        });
     }
 
     /// Adds a row to Next up immediately, before the context's upcoming rows.
@@ -19928,6 +20036,7 @@ mod tests {
         });
         app.handle_api(ApiResponse::Transferred {
             device_id: "phone".into(),
+            epoch: 0,
             result: Err(crate::api::ApiError::RateLimited),
         });
         assert!(app.remote_command_at.is_none());
@@ -19950,6 +20059,7 @@ mod tests {
 
         app.handle_api(ApiResponse::Transferred {
             device_id: "phone".into(),
+            epoch: 0,
             result: Ok(()),
         });
         assert_eq!(app.remote_poll_interval(), (REMOTE_POLL_ACTIVE, false));
@@ -24451,12 +24561,282 @@ mod tests {
         ));
         assert!(app.backend.take_player_commands().is_empty());
 
+        let local_uri = app.local.track.as_ref().unwrap().uri.clone();
+        app.backend.take_player_commands();
         app.transfer("local".into());
         assert_eq!(app.target(), Target::Local);
+        assert!(
+            app.backend.take_player_commands().is_empty(),
+            "Transfer is ignored while this Connect device is still active"
+        );
+        let now = app.now_playing_live().unwrap();
+        assert!(now.local);
+        assert_eq!(now.uri, local_uri);
+        app.backend.shutdown();
+    }
+
+    /// Local playback plus a fresh snapshot of another device.
+    fn app_playing_locally_beside(device_id: &str) -> App {
+        let mut app = headless_app();
+        app.local_ready = true;
+        app.local_device_id = Some("local".into());
+        app.local = LocalState {
+            connected: true,
+            playback: Playback::Playing,
+            track: Some(crate::player::LocalTrack {
+                uri: "spotify:track:local-song".into(),
+                title: "Local".into(),
+                ..Default::default()
+            }),
+            track_sequence: 2,
+            ..Default::default()
+        };
+        app.remote = Some(RemoteSnapshot {
+            state: PlaybackState {
+                is_playing: true,
+                progress_ms: Some(40_000),
+                item: Some(queued_song("spotify:track:safari-song")),
+                device: Some(Device {
+                    id: Some(device_id.to_string()),
+                    name: "Web Player (Safari)".into(),
+                    is_active: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            received_at: Instant::now(),
+        });
+        app
+    }
+
+    fn stopped_like(local: &LocalState) -> LocalState {
+        LocalState {
+            playback: Playback::Stopped,
+            position_ms: 0,
+            position_at: None,
+            ..local.clone()
+        }
+    }
+
+    #[test]
+    fn returning_to_this_computer_waits_until_connect_releases_it() {
+        let mut app = app_playing_locally_beside("safari");
+        app.transfer("safari".into());
+        app.transfer("phone".into());
+        assert_eq!(
+            app.backend.take_transfer_requests(),
+            [("safari".into(), 1), ("phone".into(), 2)]
+        );
+        assert_eq!(app.transfer_epoch, 2);
+
+        // An earlier acceptance must not replace the newer device.
+        app.handle_api(ApiResponse::Transferred {
+            device_id: "safari".into(),
+            epoch: 1,
+            result: Ok(()),
+        });
+        assert_eq!(app.selected_device.as_deref(), Some("phone"));
+        assert!(app.toasts.is_empty());
+
+        app.handle_api(ApiResponse::Transferred {
+            device_id: "phone".into(),
+            epoch: 2,
+            result: Ok(()),
+        });
+        assert_eq!(app.selected_device.as_deref(), Some("phone"));
+
+        app.backend.take_player_commands();
+        app.transfer("local".into());
+        assert_eq!(app.transfer_epoch, 3);
+        assert!(app.backend.take_transfer_requests().is_empty());
+        assert!(
+            app.backend.take_player_commands().is_empty(),
+            "Connect is still active, so Transfer would be discarded"
+        );
+        assert!(app.pending_local_return);
+        assert_eq!(app.target(), Target::Local);
+        let now = app.now_playing_live().unwrap();
+        assert!(now.local);
+        assert_eq!(now.uri, "spotify:track:local-song");
+        assert_eq!(app.now_playing().unwrap().uri, now.uri);
+
+        // Progress from the player that has not been released yet.
+        app.handle_local(app.local.clone());
+        assert!(app.backend.take_player_commands().is_empty());
+        assert_eq!(
+            app.now_playing_live().unwrap().uri,
+            "spotify:track:local-song"
+        );
+
+        // The superseded phone acknowledgement arrives after the return.
+        let toasts = app.toasts.len();
+        app.handle_api(ApiResponse::Transferred {
+            device_id: "phone".into(),
+            epoch: 2,
+            result: Ok(()),
+        });
+        app.handle_api(ApiResponse::Transferred {
+            device_id: "safari".into(),
+            epoch: 1,
+            result: Err(crate::api::ApiError::RateLimited),
+        });
+        assert_eq!(app.selected_device, None);
+        assert_eq!(app.target(), Target::Local);
+        assert_eq!(app.toasts.len(), toasts);
+        assert_eq!(
+            app.now_playing_live().unwrap().uri,
+            "spotify:track:local-song"
+        );
+
+        app.toggle_play();
+        assert_eq!(app.backend.take_player_commands(), [PlayerCommand::Toggle]);
+
+        app.handle_local(stopped_like(&app.local));
         assert_eq!(
             app.backend.take_player_commands(),
             [PlayerCommand::Transfer]
         );
+        assert_eq!(
+            app.now_playing_live().unwrap().uri,
+            "spotify:track:safari-song"
+        );
+        assert!(!app.now_playing_live().unwrap().local);
+
+        app.handle_local(stopped_like(&app.local));
+        assert!(
+            app.backend.take_player_commands().is_empty(),
+            "the handoff is sent once"
+        );
+
+        app.handle_local(LocalState {
+            playback: Playback::Playing,
+            track: Some(crate::player::LocalTrack {
+                uri: "spotify:track:safari-song".into(),
+                ..Default::default()
+            }),
+            track_sequence: 3,
+            ..app.local.clone()
+        });
+        let now = app.now_playing_live().unwrap();
+        assert!(now.local);
+        assert_eq!(now.uri, "spotify:track:safari-song");
+        assert_eq!(app.selected_device, None);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn a_newer_remote_choice_cancels_a_pending_local_return() {
+        let mut app = app_playing_locally_beside("safari");
+        app.transfer("safari".into());
+        app.transfer("local".into());
+        assert!(app.pending_local_return);
+        app.backend.take_player_commands();
+        app.backend.take_transfer_requests();
+        app.transfer("phone".into());
+        assert!(!app.pending_local_return);
+        assert_eq!(app.backend.take_transfer_requests(), [("phone".into(), 3)]);
+        assert_eq!(app.selected_device.as_deref(), Some("phone"));
+        app.handle_local(stopped_like(&app.local));
+        assert!(app.backend.take_player_commands().is_empty());
+        assert_eq!(app.selected_device.as_deref(), Some("phone"));
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn a_failed_remote_transfer_does_not_pull_playback_back_later() {
+        let mut app = app_playing_locally_beside("safari");
+        // Nothing else is playing. The only way to leave this computer is
+        // the transfer that then fails.
+        app.remote = None;
+        app.transfer("safari".into());
+        app.transfer("local".into());
+        assert!(app.pending_local_return);
+        app.handle_api(ApiResponse::Transferred {
+            device_id: "safari".into(),
+            epoch: 1,
+            result: Err(crate::api::ApiError::RateLimited),
+        });
+        assert!(!app.pending_local_return);
+        assert!(app.toasts.is_empty());
+        assert_eq!(app.selected_device, None);
+        app.backend.take_player_commands();
+        app.handle_local(stopped_like(&app.local));
+        assert!(app.backend.take_player_commands().is_empty());
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn an_accepted_remote_transfer_is_taken_back_when_connect_goes_inactive() {
+        let mut app = app_playing_locally_beside("safari");
+        app.transfer("safari".into());
+        app.handle_api(ApiResponse::Transferred {
+            device_id: "safari".into(),
+            epoch: 1,
+            result: Ok(()),
+        });
+        assert!(app.local.is_active());
+        app.backend.take_player_commands();
+        app.transfer("local".into());
+        assert!(app.pending_local_return);
+        assert!(app.backend.take_player_commands().is_empty());
+        assert_eq!(
+            app.now_playing_live().unwrap().uri,
+            "spotify:track:local-song"
+        );
+        app.handle_local(stopped_like(&app.local));
+        assert_eq!(
+            app.backend.take_player_commands(),
+            [PlayerCommand::Transfer]
+        );
+        // A repeated acknowledgement cannot undo the return.
+        app.handle_api(ApiResponse::Transferred {
+            device_id: "safari".into(),
+            epoch: 1,
+            result: Ok(()),
+        });
+        assert_eq!(app.selected_device, None);
+        app.handle_local(stopped_like(&app.local));
+        assert!(app.backend.take_player_commands().is_empty());
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn a_rejected_audio_key_keeps_the_remote_device_selection() {
+        let mut app = app_playing_locally_beside("safari");
+        app.transfer("safari".into());
+        app.backend.take_player_commands();
+        app.handle_local(LocalState {
+            playback: Playback::Stopped,
+            loading: false,
+            position_at: None,
+            error: Some("Spotify refused the audio key. Try again later".into()),
+            ..app.local.clone()
+        });
+        assert_eq!(app.selected_device.as_deref(), Some("safari"));
+        assert_eq!(app.target(), Target::Remote(Some("safari".into())));
+        assert!(app.backend.take_player_commands().is_empty());
+        app.handle_local(stopped_like(&app.local));
+        assert!(app.backend.take_player_commands().is_empty());
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn a_rejected_audio_key_does_not_send_the_deferred_return() {
+        let mut app = app_playing_locally_beside("safari");
+        app.transfer("safari".into());
+        app.transfer("local".into());
+        assert!(app.pending_local_return);
+        app.backend.take_player_commands();
+        app.handle_local(LocalState {
+            playback: Playback::Stopped,
+            loading: false,
+            position_at: None,
+            error: Some("Spotify refused the audio key. Try again later".into()),
+            ..app.local.clone()
+        });
+        assert_eq!(app.selected_device, None);
+        assert!(app.backend.take_player_commands().is_empty());
+        assert!(!app.pending_local_return);
         app.backend.shutdown();
     }
 

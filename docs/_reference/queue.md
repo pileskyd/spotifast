@@ -63,6 +63,8 @@ Since 0.9.0, switching from another Connect device back to this
 computer transfers that device's current song, position, and queue, including
 manually queued copies. A paused session stays paused. The handoff itself does
 not consume a queue row or restore an older queue saved on this computer.
+If this computer is still playing when it is chosen, that transfer waits
+until playback here stops, then runs once.
 
 1. **The list shows the play order.** The top row plays next, followed by the
    rows below it.

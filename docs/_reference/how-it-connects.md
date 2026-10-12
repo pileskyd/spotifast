@@ -390,6 +390,10 @@ the current song, position, playing or paused state, context, and queue together
 This uses the existing playback session's Connect transfer request and needs
 no additional authorization. An old or unavailable Web API playback snapshot
 does not cause the previous local song to restart or replace the remote queue.
+If this computer is still the active player, librespot ignores that transfer.
+Spotifast keeps the choice and sends it once the player becomes inactive, so
+the other device's song and queue still arrive together. A late answer for an
+earlier switch cannot undo a newer choice.
 
 When the PulseAudio backend is selected on Linux, its PulseAudio or PipeWire
 stream is named **Spotifast**, with **Spotify playback** as its description, so

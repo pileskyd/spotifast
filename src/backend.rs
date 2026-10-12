@@ -298,6 +298,9 @@ pub enum ApiRequest {
     Transfer {
         device_id: String,
         play: bool,
+        /// [`crate::app`] transfer generation. Echoed on the answer so a
+        /// slower switch cannot overwrite a newer one.
+        epoch: u64,
     },
     /// Shuffle on, then start the context, one after the other: sent as two
     /// independent requests they race, and shuffle sometimes lost.
@@ -528,6 +531,7 @@ pub enum ApiResponse {
     },
     Transferred {
         device_id: String,
+        epoch: u64,
         result: ApiResult<()>,
     },
     QueueAdded {
@@ -949,6 +953,8 @@ pub struct Backend {
     #[cfg(test)]
     player_commands: std::sync::Mutex<Vec<PlayerCommand>>,
     #[cfg(test)]
+    transfer_requests: std::sync::Mutex<Vec<(String, u64)>>,
+    #[cfg(test)]
     album_type_requests: std::sync::Mutex<Vec<Vec<String>>>,
     #[cfg(test)]
     home_episode_requests: std::sync::Mutex<Vec<(Vec<String>, u64)>>,
@@ -1042,6 +1048,8 @@ impl Backend {
             #[cfg(test)]
             player_commands: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
+            transfer_requests: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
             album_type_requests: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             home_episode_requests: std::sync::Mutex::new(Vec::new()),
@@ -1113,6 +1121,16 @@ impl Backend {
     }
 
     pub fn api(&self, request: ApiRequest) {
+        #[cfg(test)]
+        if let ApiRequest::Transfer {
+            device_id, epoch, ..
+        } = &request
+        {
+            self.transfer_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((device_id.clone(), *epoch));
+        }
         #[cfg(test)]
         if matches!(
             request,
@@ -1289,6 +1307,16 @@ impl Backend {
     #[cfg(test)]
     pub(crate) fn take_player_commands(&self) -> Vec<PlayerCommand> {
         std::mem::take(&mut *self.player_commands.lock().unwrap())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_transfer_requests(&self) -> Vec<(String, u64)> {
+        std::mem::take(
+            &mut *self
+                .transfer_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 
     pub fn player(&self, command: PlayerCommand) {
@@ -4330,9 +4358,14 @@ async fn handle(
                 result,
             }
         }
-        ApiRequest::Transfer { device_id, play } => ApiResponse::Transferred {
+        ApiRequest::Transfer {
+            device_id,
+            play,
+            epoch,
+        } => ApiResponse::Transferred {
             result: routed!(transfer(&device_id, play)),
             device_id,
+            epoch,
         },
         ApiRequest::AddToQueue {
             uri,
@@ -4414,11 +4447,14 @@ async fn over_connect(
                 result,
             }
         }
-        ApiRequest::Transfer { device_id, .. } => {
+        ApiRequest::Transfer {
+            device_id, epoch, ..
+        } => {
             connect.restricted_target(Some(device_id))?;
             ApiResponse::Transferred {
                 result: connect.transfer(session, device_id).await,
                 device_id: device_id.clone(),
+                epoch: *epoch,
             }
         }
         ApiRequest::AddToQueue {
