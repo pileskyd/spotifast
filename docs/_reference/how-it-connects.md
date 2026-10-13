@@ -131,7 +131,9 @@ current-track pickup.
   Windows. Librespot retains its reusable credential in memory; Spotifast
   owns persistence. Flatpak can talk to `org.freedesktop.secrets` for this.
   Version 0.7.1 still uses the older unencrypted files.
-  See [migration, sign-out, and storage protection](/settings-and-files/).
+  On macOS each grant is a separate Keychain item, and an ad-hoc build's
+  "Always Allow" lasts only until the next rebuild. See
+  [migration, sign-out, and storage protection](/settings-and-files/).
 - Downloaded audio and artwork, in the cache directory, within the budget
   you set.
 - The first time MilkDrop opens with an empty preset folder, the two projectM

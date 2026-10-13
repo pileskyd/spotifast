@@ -57,6 +57,16 @@ KWallet to remember a new sign-in. Flatpak is allowed to talk to
 produces an error without blocking the interface. A new sign-in can still be
 used for this session, with no new plaintext fallback file.
 
+On macOS, Keychain stores each grant as its own item. **Always Allow** trusts
+this copy of Spotifast for that one item. The other saved grants still ask,
+one at a time. An ad-hoc signature is identified by its code directory hash, so
+a rebuilt app is a new app and Keychain asks once per saved item again. A local
+bundle can keep the same trust across rebuilds by setting `CODESIGN_IDENTITY`
+to a code signing certificate that is already in the login keychain. Spotifast
+keeps a grant it has read for the rest of that run. An answer that arrives
+after the first wait still signs that session in. A failed read contacts
+Keychain again only when something asks for that grant again.
+
 On upgrade, each legacy grant is written to the protected store and read back
 before its old file is removed. Valid grants migrate without signing in again.
 If Spotify rejects a saved refresh grant, only that grant is forgotten so the

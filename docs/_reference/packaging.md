@@ -25,6 +25,10 @@ installation checks require the exact identity expected for that version.
 
 The application retains its Flatpak manifests, macOS bundle/signing configuration
 and Windows installer sources. nFPM does not replace these platform tools.
+`packaging/macos/bundle.sh` signs with `CODESIGN_IDENTITY` when that variable
+names a code signing certificate already in the login keychain. Otherwise the
+bundle is ad-hoc: macOS ties Keychain access to that build's code directory
+hash, so each rebuild asks again. The script does not create a certificate.
 
 Releases after 0.12.0 install on Windows through a per-user Windows Installer
 package (`.msi`, built with the WiX Toolset from `packaging/windows/spotifast.wxs`)

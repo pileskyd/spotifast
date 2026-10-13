@@ -2381,7 +2381,7 @@ impl Worker {
         let lease = self.credentials.lease(CredentialSlot::Proxy);
         let commands = self.commands.clone();
         tokio::spawn(async move {
-            let result = lease.load().await;
+            let result = settle_stored_grant(lease.clone()).await;
             let _ = commands.send(Command::ProxyRestored { lease, result });
         });
     }
@@ -2397,18 +2397,24 @@ impl Worker {
             self.api
                 .set_state(ApiSource::Personal, SessionState::Authorizing);
         }
-        for slot in CredentialSlot::SPOTIFY {
-            let lease = self.credentials.lease(slot);
-            let commands = self.commands.clone();
-            tokio::spawn(async move {
-                let result = lease.load().await;
+        // One grant at a time. macOS shows a separate Keychain prompt per item,
+        // and queueing the other two while the first dialog is still open stacks
+        // prompts whose results the 20s wait would otherwise discard.
+        let leases: Vec<_> = CredentialSlot::SPOTIFY
+            .into_iter()
+            .map(|slot| (slot, self.credentials.lease(slot)))
+            .collect();
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            for (slot, lease) in leases {
+                let result = settle_stored_grant(lease.clone()).await;
                 let _ = commands.send(Command::CredentialsRestored {
                     slot,
                     lease,
                     result,
                 });
-            });
-        }
+            }
+        });
     }
 
     fn on_credentials_restored(
@@ -3790,6 +3796,17 @@ impl Worker {
                 }
             }
         });
+    }
+}
+
+/// One platform read. A timeout means the prompt is still unanswered, so wait
+/// for that same read instead of starting another one.
+async fn settle_stored_grant(
+    lease: CredentialLease,
+) -> Result<crate::credentials::Loaded, crate::credentials::Error> {
+    match lease.load().await {
+        Err(crate::credentials::Error::Timeout) => lease.recover().await,
+        other => other,
     }
 }
 

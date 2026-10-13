@@ -40,6 +40,10 @@ done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/spotifast.icns"
 
 # arm64 refuses to launch an unsigned bundle, so sign one way or another.
+# CODESIGN_IDENTITY must already be a codesigning certificate. This script does
+# not create one and does not change keychain trust. An ad-hoc signature's
+# designated requirement is the code directory hash, so Keychain "Always Allow"
+# does not apply to the next build.
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then
     codesign --force --timestamp --options runtime \
         --sign "$CODESIGN_IDENTITY" "$app"

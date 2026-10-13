@@ -4,7 +4,17 @@
 //! the UI, command loop, or runtime shutdown hostage. Generation checks reject
 //! work from before sign-out, including a write that returns after sign-out.
 //! Non-secret revocation markers prevent restoration after a failed deletion.
+//!
+//! Each grant is its own credential item. On macOS that item's access list
+//! records the app's designated requirement. An ad-hoc signature's requirement
+//! is that build's code directory hash, so an earlier "Always Allow" does not
+//! cover a rebuilt binary or any other grant. One read is in flight per grant
+//! and authorization generation. A timed-out waiter does not start another
+//! read. [`Lease::recover`] receives the original read when it finishes. A
+//! grant that this process has already read stays in memory, so a later read
+//! does not ask the platform store again.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -22,7 +32,7 @@ use crate::{auth::StoredToken, paths::AppDirs};
 const SERVICE: &str = "rocks.spotifast.Spotifast";
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Slot {
     Shared,
@@ -224,6 +234,12 @@ struct Inner {
     // Held only around the tiny local marker files, never a native store call.
     markers: Mutex<()>,
     jobs: mpsc::SyncSender<Job>,
+    timeout: Duration,
+    // One platform read per grant generation. The worker publishes on `late`
+    // and then removes the entry. Waiters that already timed out still recover
+    // from that publication or from `memory`.
+    loads: Mutex<HashMap<String, Arc<Flight>>>,
+    memory: Mutex<HashMap<(u64, Slot), Grant>>,
 }
 
 #[derive(Clone)]
@@ -245,9 +261,14 @@ struct Marker {
     revoked: bool,
 }
 
+#[derive(Clone)]
 pub struct Loaded {
     pub grant: Option<Grant>,
     pub warning: Option<Error>,
+}
+
+struct Flight {
+    late: tokio::sync::watch::Sender<Option<Result<Loaded, Error>>>,
 }
 
 impl Store {
@@ -260,7 +281,15 @@ impl Store {
         tests::memory_store(dirs)
     }
 
-    fn with_backend(dirs: AppDirs, mut backend: Box<dyn ProtectedStore>) -> Self {
+    fn with_backend(dirs: AppDirs, backend: Box<dyn ProtectedStore>) -> Self {
+        Self::with_backend_timeout(dirs, backend, TIMEOUT)
+    }
+
+    fn with_backend_timeout(
+        dirs: AppDirs,
+        mut backend: Box<dyn ProtectedStore>,
+        timeout: Duration,
+    ) -> Self {
         let (jobs, receiver) = mpsc::sync_channel::<Job>(16);
         let runtime = tokio::runtime::Handle::try_current().ok();
         let _ = std::thread::Builder::new()
@@ -287,7 +316,24 @@ impl Store {
                 generations: std::array::from_fn(|_| AtomicU64::new(0)),
                 markers: Mutex::new(()),
                 jobs,
+                timeout,
+                loads: Mutex::new(HashMap::new()),
+                memory: Mutex::new(HashMap::new()),
             }),
+        }
+    }
+
+    fn finish_load(&self, key: &str, flight: &Arc<Flight>) {
+        let mut loads = self
+            .inner
+            .loads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if loads
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            loads.remove(key);
         }
     }
 
@@ -302,6 +348,11 @@ impl Store {
     /// Invalidate in-flight work before canceling workers or deleting grants.
     pub fn invalidate(&self, slot: Slot) {
         self.inner.generations[slot.index()].fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .memory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|&(_, remembered), _| remembered != slot);
     }
 
     /// Persist revocation before contacting the native store. Even a locked
@@ -455,6 +506,26 @@ impl Store {
     }
 }
 
+async fn wait_flight(flight: Arc<Flight>, timeout: Option<Duration>) -> Result<Loaded, Error> {
+    let mut received = flight.late.subscribe();
+    let wait = async {
+        loop {
+            if let Some(result) = received.borrow().clone() {
+                return result;
+            }
+            if received.changed().await.is_err() {
+                return Err(Error::Unavailable);
+            }
+        }
+    };
+    match timeout {
+        Some(limit) => tokio::time::timeout(limit, wait)
+            .await
+            .map_err(|_| Error::Timeout)?,
+        None => wait.await,
+    }
+}
+
 fn remove_file(path: &Path) -> Result<(), Error> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -522,61 +593,166 @@ impl Lease {
     }
 
     pub async fn load(&self) -> Result<Loaded, Error> {
-        self.request(true, |lease, backend| {
-            let marker = lease.store.marker(lease.slot)?;
-            if marker.as_ref().is_some_and(|marker| marker.revoked) {
-                return Ok(Loaded {
-                    grant: None,
-                    warning: None,
-                });
-            }
-            let existing = backend.read(&lease.key());
-            if let Ok(Some(bytes)) = &existing {
-                let record: Record = serde_json::from_slice(bytes).map_err(|_| Error::Invalid)?;
-                if record.version != 1
-                    || record.slot != lease.slot
-                    || !record.grant.valid_for(lease.slot)
-                {
-                    return Err(Error::Invalid);
-                }
-                let _guard = lease
-                    .store
-                    .inner
-                    .markers
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                lease.check()?;
-                lease.store.write_marker(lease.slot, false)?;
-                let warning = lease.store.remove_legacy(lease.slot).err();
-                return Ok(Loaded {
-                    grant: Some(record.grant),
-                    warning,
-                });
-            }
-            if marker.is_some() {
-                return existing.map(|_| Loaded {
-                    grant: None,
-                    warning: None,
-                });
-            }
-            let Some(grant) = lease.store.legacy(lease.slot)? else {
-                return existing.map(|_| Loaded {
-                    grant: None,
-                    warning: None,
-                });
-            };
-            // Keep a failed migration recoverable. No new plaintext is written,
-            // and the caller must show the warning about persistence.
-            let warning = match existing {
-                Err(error) => Some(error),
-                Ok(_) => lease.save_inner(backend, grant.clone()).err(),
-            };
-            Ok(Loaded {
+        if let Some(grant) = self.remembered() {
+            return Ok(Loaded {
                 grant: Some(grant),
+                warning: None,
+            });
+        }
+        let flight = self.begin_load()?;
+        wait_flight(flight, Some(self.store.inner.timeout)).await
+    }
+
+    /// Wait for the read already started by [`Self::load`]. This does not
+    /// contact the platform store again. A finished read that stayed in
+    /// process memory is returned immediately.
+    pub async fn recover(&self) -> Result<Loaded, Error> {
+        if let Some(grant) = self.remembered() {
+            return Ok(Loaded {
+                grant: Some(grant),
+                warning: None,
+            });
+        }
+        let key = self.flight_key();
+        let flight = self
+            .store
+            .inner
+            .loads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned();
+        let Some(flight) = flight else {
+            return self.remembered().map_or(Err(Error::Timeout), |grant| {
+                Ok(Loaded {
+                    grant: Some(grant),
+                    warning: None,
+                })
+            });
+        };
+        wait_flight(flight, None).await
+    }
+
+    fn remembered(&self) -> Option<Grant> {
+        self.store
+            .inner
+            .memory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(self.generation, self.slot))
+            .cloned()
+    }
+
+    fn remember(&self, grant: Grant) {
+        if !self.current() {
+            return;
+        }
+        self.store
+            .inner
+            .memory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((self.generation, self.slot), grant);
+    }
+
+    fn flight_key(&self) -> String {
+        format!("{}:{}", self.generation, self.key())
+    }
+
+    fn begin_load(&self) -> Result<Arc<Flight>, Error> {
+        self.check()?;
+        let key = self.flight_key();
+        let mut loads = self
+            .store
+            .inner
+            .loads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = loads.get(&key) {
+            return Ok(existing.clone());
+        }
+        let (late, _) = tokio::sync::watch::channel(None);
+        let flight = Arc::new(Flight { late });
+        loads.insert(key.clone(), flight.clone());
+        drop(loads);
+
+        let lease = self.clone();
+        let flight_job = flight.clone();
+        let job_key = key.clone();
+        if self
+            .store
+            .inner
+            .jobs
+            .try_send(Box::new(move |backend| {
+                let result = lease.perform_load(backend);
+                if let Ok(loaded) = &result
+                    && loaded.warning.is_none()
+                    && let Some(grant) = &loaded.grant
+                {
+                    lease.remember(grant.clone());
+                }
+                let _ = flight_job.late.send(Some(result));
+                lease.store.finish_load(&job_key, &flight_job);
+            }))
+            .is_err()
+        {
+            self.store.finish_load(&key, &flight);
+            return Err(Error::Unavailable);
+        }
+        Ok(flight)
+    }
+
+    fn perform_load(&self, backend: &mut dyn ProtectedStore) -> Result<Loaded, Error> {
+        let marker = self.store.marker(self.slot)?;
+        if marker.as_ref().is_some_and(|marker| marker.revoked) {
+            return Ok(Loaded {
+                grant: None,
+                warning: None,
+            });
+        }
+        let existing = backend.read(&self.key());
+        if let Ok(Some(bytes)) = &existing {
+            let record: Record = serde_json::from_slice(bytes).map_err(|_| Error::Invalid)?;
+            if record.version != 1 || record.slot != self.slot || !record.grant.valid_for(self.slot)
+            {
+                return Err(Error::Invalid);
+            }
+            let _guard = self
+                .store
+                .inner
+                .markers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.check()?;
+            self.store.write_marker(self.slot, false)?;
+            let warning = self.store.remove_legacy(self.slot).err();
+            return Ok(Loaded {
+                grant: Some(record.grant),
                 warning,
-            })
+            });
+        }
+        if marker.is_some() {
+            return existing.map(|_| Loaded {
+                grant: None,
+                warning: None,
+            });
+        }
+        let Some(grant) = self.store.legacy(self.slot)? else {
+            return existing.map(|_| Loaded {
+                grant: None,
+                warning: None,
+            });
+        };
+        // Keep a failed migration recoverable. No new plaintext is written,
+        // and the caller must show the warning about persistence.
+        let warning = match existing {
+            Err(error) => Some(error),
+            Ok(_) => self.save_inner(backend, grant.clone()).err(),
+        };
+        Ok(Loaded {
+            grant: Some(grant),
+            warning,
         })
-        .await
     }
 
     fn save_inner(&self, backend: &mut dyn ProtectedStore, grant: Grant) -> Result<(), Error> {
@@ -640,6 +816,9 @@ mod tests {
     struct Fake {
         values: HashMap<String, Vec<u8>>,
         read_error: Option<Error>,
+        read_count: u64,
+        read_entered: Option<tokio::sync::oneshot::Sender<()>>,
+        read_release: Option<mpsc::Receiver<()>>,
         write_error: Option<Error>,
         delete_error: Option<Error>,
         discard_write: bool,
@@ -655,11 +834,25 @@ mod tests {
     struct Backend(Arc<Mutex<Fake>>);
     impl ProtectedStore for Backend {
         fn read(&mut self, key: &str) -> Result<Option<Vec<u8>>, Error> {
-            let fake = self.0.lock().unwrap();
-            if let Some(error) = fake.read_error {
-                return Err(error);
+            let (entered, release, value) = {
+                let mut fake = self.0.lock().unwrap();
+                fake.read_count += 1;
+                if let Some(error) = fake.read_error {
+                    return Err(error);
+                }
+                (
+                    fake.read_entered.take(),
+                    fake.read_release.take(),
+                    fake.values.get(key).cloned(),
+                )
+            };
+            if let Some(entered) = entered {
+                let _ = entered.send(());
             }
-            Ok(fake.values.get(key).cloned())
+            if let Some(release) = release {
+                release.recv().unwrap();
+            }
+            Ok(value)
         }
         fn write(&mut self, key: &str, value: &[u8]) -> Result<(), Error> {
             let (entered, release) = {
@@ -698,6 +891,12 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::open(TIMEOUT)
+        }
+        fn with_timeout(timeout: Duration) -> Self {
+            Self::open(timeout)
+        }
+        fn open(timeout: Duration) -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let root = std::env::temp_dir().join(format!(
                 "spotifast-credential-tests-{}-{}",
@@ -711,7 +910,8 @@ mod tests {
             };
             dirs.ensure().unwrap();
             let fake = Arc::new(Mutex::new(Fake::default()));
-            let store = Store::with_backend(dirs.clone(), Box::new(Backend(fake.clone())));
+            let store =
+                Store::with_backend_timeout(dirs.clone(), Box::new(Backend(fake.clone())), timeout);
             Self { dirs, fake, store }
         }
         fn restart(&self) -> Store {
@@ -1233,5 +1433,55 @@ mod tests {
                 Err(Error::Invalid)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn one_keychain_read_serves_concurrent_waiters_after_timeout() {
+        let f = Fixture::with_timeout(Duration::from_millis(400));
+        let grant = web(crate::auth::DEFAULT_WEB_CLIENT_ID);
+        f.store
+            .lease(Slot::Shared)
+            .save(grant.clone())
+            .await
+            .unwrap();
+        let reads_after_save = f.fake.lock().unwrap().read_count;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        {
+            let mut fake = f.fake.lock().unwrap();
+            fake.read_entered = Some(entered_tx);
+            fake.read_release = Some(release_rx);
+        }
+        let lease = f.store.lease(Slot::Shared);
+        let first = lease.clone();
+        let second = lease.clone();
+        let first = tokio::spawn(async move { first.load().await });
+        entered_rx.await.unwrap();
+        let second = tokio::spawn(async move { second.load().await });
+        assert!(matches!(first.await.unwrap(), Err(Error::Timeout)));
+        assert!(matches!(second.await.unwrap(), Err(Error::Timeout)));
+        assert_eq!(f.fake.lock().unwrap().read_count, reads_after_save + 1);
+
+        let pending = lease.recover();
+        release_tx.send(()).unwrap();
+        let loaded = pending.await.unwrap();
+        assert!(loaded.grant == Some(grant.clone()));
+        assert_eq!(loaded.warning, None);
+        assert_eq!(f.fake.lock().unwrap().read_count, reads_after_save + 1);
+        assert!(lease.load().await.unwrap().grant == Some(grant));
+        assert_eq!(f.fake.lock().unwrap().read_count, reads_after_save + 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_can_be_retried_and_recovery_does_not_read_again() {
+        let f = Fixture::new();
+        f.fake.lock().unwrap().read_error = Some(Error::Locked);
+        let lease = f.store.lease(Slot::Shared);
+        assert!(matches!(lease.load().await, Err(Error::Locked)));
+        assert!(matches!(lease.recover().await, Err(Error::Timeout)));
+        assert_eq!(f.fake.lock().unwrap().read_count, 1);
+        f.fake.lock().unwrap().read_error = None;
+        assert!(lease.load().await.unwrap().grant.is_none());
+        assert_eq!(f.fake.lock().unwrap().read_count, 2);
     }
 }
